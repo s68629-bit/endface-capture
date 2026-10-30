@@ -57,11 +57,22 @@ button:disabled,.btn.disabled{opacity:.45;pointer-events:none}
 <p class="sub">掃批號 → 拍照 → 用批號自動命名存檔。照片只存在你的手機，不會上傳。</p>
 
 <div class="card">
-  <h2>① 批號</h2>
+  <h2>① 批號（大卷＋小卷）</h2>
   <button class="primary big" id="btnScan" type="button">📷 掃描批號 QR</button>
-  <label for="lot">批號（掃到後可修改，也可直接輸入）</label>
-  <input type="text" id="lot" autocomplete="off" autocapitalize="characters" placeholder="尚未掃描">
-  <div id="rawNote" class="hint"></div>
+  <p class="hint" id="scanHint">會先掃「大卷批號」，再掃「小卷批號」。大卷已有時，只掃小卷。</p>
+  <label for="lotBig">大卷批號</label>
+  <div class="row"><input type="text" id="lotBig" autocomplete="off" autocapitalize="characters" placeholder="尚未掃描">
+    <button type="button" id="btnRescanBig" style="flex:0 0 auto">重掃</button></div>
+  <div id="rawBig" class="hint"></div>
+  <label for="lotSmall">小卷批號</label>
+  <div class="row"><input type="text" id="lotSmall" autocomplete="off" autocapitalize="characters" placeholder="尚未掃描">
+    <button type="button" id="btnRescanSmall" style="flex:0 0 auto">重掃</button></div>
+  <div id="rawSmall" class="hint"></div>
+  <label>完整批號（檔名用）</label>
+  <div class="name" id="lotFull">—</div>
+  <label class="hint" style="display:flex;gap:8px;align-items:center;margin-top:8px">
+    <input type="checkbox" id="keepBig" checked style="width:20px;height:20px">
+    存完一顆小卷後，保留大卷批號（同一大卷的下一顆只需掃小卷）</label>
 </div>
 
 <div class="card">
@@ -79,7 +90,13 @@ button:disabled,.btn.disabled{opacity:.45;pointer-events:none}
     <button type="button" data-f="A" class="on">A 面</button>
     <button type="button" data-f="B">B 面</button>
   </div>
-  <p class="hint">存完 A 面會自動換成 B 面；存完 B 面會清除批號，準備掃下一顆。</p>
+  <label for="saveMode">照片存到哪裡</label>
+  <select id="saveMode">
+    <option value="files">檔案／OneDrive（保留批號檔名，建議）</option>
+    <option value="photos">相簿（iPhone 會把檔名改成 IMG_xxxx）</option>
+  </select>
+  <p class="hint" id="saveModeHint"></p>
+  <p class="hint">存完 A 面會自動換成 B 面；存完 B 面會清除小卷批號（大卷依上面的勾選），準備掃下一顆。</p>
 </div>
 
 <div class="card">
@@ -93,13 +110,13 @@ button:disabled,.btn.disabled{opacity:.45;pointer-events:none}
     <div class="name" id="fname"></div>
     <div id="shotWarn" class="warn" style="display:none"></div>
     <div class="row" style="margin-top:8px">
-      <button class="primary" id="btnSave" type="button">儲存（分享／存到檔案）</button>
+      <button class="primary" id="btnSave" type="button">儲存</button>
     </div>
     <div class="row" style="margin-top:8px">
       <button id="btnDl" type="button">直接下載</button>
       <button id="btnRetake" type="button">重拍</button>
     </div>
-    <p class="hint">iPhone：選單裡請選「<b>儲存到檔案</b>」才會保留批號檔名；選「儲存影像」存進相簿時，檔名會被 iPhone 改成 IMG_xxxx。</p>
+    <p class="hint" id="saveTip"></p>
   </div>
 </div>
 
@@ -10273,13 +10290,16 @@ function nextSeq(lot, face){
 /* ---------- 狀態 ---------- */
 let face = 'A';
 let shot = null;     // {file, w, h, url}
-function curLot(){ return cleanLot($('lot').value); }
+function curLot(){
+  return [cleanLot($('lotBig').value), cleanLot($('lotSmall').value)].filter(Boolean).join('_');
+}
 function buildName(){
   const lot = curLot();
-  if(!lot) return '';
+  if(!$('lotSmall').value.trim() && !$('lotBig').value.trim()) return '';
   return lot+'_'+face+'_'+pad2(nextSeq(lot, face))+'_t'+$('thick').value+'.jpg';
 }
 function refreshName(){
+  $('lotFull').textContent = curLot() || '—';
   if(shot){ $('fname').textContent = buildName() || '（請先輸入批號）'; }
   $('warnLot').style.display = 'none';
 }
@@ -10289,61 +10309,95 @@ function setFace(f){
   refreshName();
 }
 document.querySelectorAll('#faceSeg button').forEach(b=> b.addEventListener('click', ()=> setFace(b.dataset.f)));
-$('lot').addEventListener('input', refreshName);
+$('lotBig').addEventListener('input', refreshName);
+$('lotSmall').addEventListener('input', refreshName);
 $('thick').addEventListener('change', ()=>{ lsSet('cap_thick', $('thick').value); refreshName(); });
 (function(){ const t = lsGet('cap_thick'); if(t) $('thick').value = t; })();
 
 /* ---------- 掃描 QR ---------- */
-let stream = null, scanning = false;
+let stream = null, scanning = false, queue = [], taken = [];
 const vid = $('vid'), cv = document.createElement('canvas'), cx = cv.getContext('2d', {willReadFrequently:true});
-function decodeFrame(source, w, h){
-  const k = Math.min(1, 720 / Math.max(w, h));
+const TARGET = {big:{label:'大卷', inp:'lotBig', raw:'rawBig'}, small:{label:'小卷', inp:'lotSmall', raw:'rawSmall'}};
+function grab(source, w, h){
+  const k = Math.min(1, 1000 / Math.max(w, h));
   cv.width = Math.round(w*k); cv.height = Math.round(h*k);
   cx.drawImage(source, 0, 0, cv.width, cv.height);
-  const img = cx.getImageData(0, 0, cv.width, cv.height);
+}
+function decodeRegion(x, y, w, h){
+  const img = cx.getImageData(x, y, w, h);
   return jsQR(img.data, img.width, img.height, {inversionAttempts:'attemptBoth'});
+}
+// 回傳畫面中找得到的所有 QR 內容。jsQR 同一畫面有兩個 QR 時常讀不出來，
+// 所以另外把畫面切成左右、上下、四角再各讀一次，最後合併。
+function findCodes(source, w, h){
+  grab(source, w, h);
+  const W = cv.width, H = cv.height, hw = Math.floor(W/2), hh = Math.floor(H/2);
+  const regs = [[0,0,W,H],[0,0,hw,H],[hw,0,W-hw,H],[0,0,W,hh],[0,hh,W,H-hh],
+                [0,0,hw,hh],[hw,0,W-hw,hh],[0,hh,hw,H-hh],[hw,hh,W-hw,H-hh]];
+  const out = [];
+  for(const r of regs){
+    const q = decodeRegion(r[0], r[1], r[2], r[3]);
+    if(q && q.data && !out.includes(q.data)) out.push(q.data);
+  }
+  return out;
 }
 function stopScan(){
   scanning = false;
   if(stream){ stream.getTracks().forEach(t=>t.stop()); stream = null; }
   vid.srcObject = null; $('scanner').classList.remove('on');
 }
-function gotCode(text){
-  const raw = String(text).trim();
-  $('lot').value = raw;
+function setTarget(name, text){
+  const T = TARGET[name], raw = String(text).trim();
+  $(T.inp).value = raw;
   const clean = cleanLot(raw);
-  $('rawNote').textContent = (clean !== raw) ? ('QR 內容：'+raw+'（檔名中會寫成：'+clean+'）') : '';
-  if(navigator.vibrate) try{ navigator.vibrate(60); }catch(e){}
+  $(T.raw).textContent = 'QR 內容：'+raw+((clean !== raw) ? '（檔名中寫成：'+clean+'）' : '');
   refreshName();
-  toast('已掃到：'+clean);
 }
-async function startScan(){
+function scanMsg(s){ $('scanMsg').textContent = s; }
+async function startScan(targets){
   if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
     toast('這個瀏覽器不能開相機掃描，請直接輸入批號', 3500); return; }
+  queue = targets.slice(); taken = [];
   try{
-    stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'}}, audio:false});
+    stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'}, width:{ideal:1920}, height:{ideal:1080}}, audio:false});
   }catch(e){
     toast('無法開啟相機（請允許相機權限，並用 https 網址開啟）', 4000); return; }
   vid.srcObject = stream;
   $('scanner').classList.add('on');
+  scanMsg('請掃「'+TARGET[queue[0]].label+'批號」QR');
   try{ await vid.play(); }catch(e){}
   scanning = true;
+  let pause = 0;
   const tick = ()=>{
     if(!scanning) return;
-    if(vid.videoWidth){
-      const r = decodeFrame(vid, vid.videoWidth, vid.videoHeight);
-      if(r && r.data){ stopScan(); gotCode(r.data); return; }
+    if(vid.videoWidth && Date.now() > pause){
+      const codes = findCodes(vid, vid.videoWidth, vid.videoHeight).filter(c=> !taken.includes(c));
+      const cur = queue[0];
+      if(codes.length === 1){
+        taken.push(codes[0]); setTarget(cur, codes[0]); queue.shift();
+        if(navigator.vibrate) try{ navigator.vibrate(60); }catch(e){}
+        if(!queue.length){ stopScan(); toast('已掃到：'+curLot(), 2600); return; }
+        scanMsg('已掃到'+TARGET[cur].label+'：'+codes[0]+'。請掃「'+TARGET[queue[0]].label+'批號」QR');
+        pause = Date.now() + 1200;
+      } else if(codes.length > 1){
+        scanMsg('畫面裡有 '+codes.length+' 個 QR，請只對準「'+TARGET[cur].label+'批號」那一個');
+      }
     }
-    setTimeout(()=> requestAnimationFrame(tick), 80);
+    setTimeout(()=> requestAnimationFrame(tick), 90);
   };
   tick();
 }
-$('btnScan').addEventListener('click', startScan);
+$('btnScan').addEventListener('click', ()=>{
+  const bigFilled = $('lotBig').value.trim() !== '';
+  startScan(bigFilled ? ['small'] : ['big','small']);
+});
+$('btnRescanBig').addEventListener('click', ()=> startScan(['big']));
+$('btnRescanSmall').addEventListener('click', ()=> startScan(['small']));
 $('btnScanClose').addEventListener('click', stopScan);
 
 /* ---------- 拍照 ---------- */
 $('btnShoot').addEventListener('click', e=>{
-  if(!curLot()){ e.preventDefault(); $('warnLot').style.display='block'; $('lot').focus(); }
+  if(!$('lotSmall').value.trim()){ e.preventDefault(); $('warnLot').style.display='block'; $('warnLot').textContent='請先掃描或輸入小卷批號（大卷批號也建議一起填）。'; }
 });
 $('cam').addEventListener('change', ()=>{
   const f = $('cam').files && $('cam').files[0];
@@ -10375,11 +10429,15 @@ $('btnRetake').addEventListener('click', ()=>{
 /* ---------- 存檔 ---------- */
 function afterSaved(name){
   const lot = curLot();
-  LOG.push({name, lot, face, time:nowStr()}); logSave(); logRender();
+  LOG.push({name, lot, big:$('lotBig').value.trim(), small:$('lotSmall').value.trim(), face, time:nowStr(), mode:$('saveMode').value}); logSave(); logRender();
   if(shot && shot.url) URL.revokeObjectURL(shot.url);
   shot = null; $('shotBox').style.display = 'none';
   if(face === 'A'){ setFace('B'); toast('已存：'+name+'  → 接著拍 B 面', 2800); }
-  else { $('lot').value = ''; $('rawNote').textContent = ''; setFace('A'); toast('已存：'+name+'  → 請掃下一顆', 2800); }
+  else {
+    $('lotSmall').value = ''; $('rawSmall').textContent = '';
+    if(!$('keepBig').checked){ $('lotBig').value = ''; $('rawBig').textContent = ''; }
+    setFace('A'); refreshName(); toast('已存：'+name+'  → 請掃下一顆小卷', 2800);
+  }
 }
 function downloadFile(file, name){
   const a = document.createElement('a');
@@ -10410,7 +10468,7 @@ $('btnDl').addEventListener('click', ()=>{
 /* ---------- 紀錄表 ---------- */
 $('btnCsv').addEventListener('click', ()=>{
   if(!LOG.length){ toast('今天還沒有紀錄'); return; }
-  const rows = [['檔名','批號','端面','時間']].concat(LOG.map(x=>[x.name,x.lot,x.face,todayStr()+' '+x.time]));
+  const rows = [['檔名','完整批號','大卷批號','小卷批號','端面','存放方式','時間']].concat(LOG.map(x=>[x.name,x.lot,x.big||'',x.small||'',x.face,x.mode==='photos'?'相簿':'檔案/OneDrive',todayStr()+' '+x.time]));
   const csv = rows.map(r=> r.map(v=>{ v=String(v); return /[",\n]/.test(v) ? '"'+v.replace(/"/g,'""')+'"' : v; }).join(',')).join('\r\n');
   const f = new File(['﻿'+csv], '拍攝紀錄_'+todayStr()+'.csv', {type:'text/csv'});
   downloadFile(f, f.name);
@@ -10420,7 +10478,21 @@ $('btnClear').addEventListener('click', ()=>{
   if(confirm('確定清除今天的 '+LOG.length+' 筆紀錄？（已存的照片不受影響）')){ LOG = []; logSave(); logRender(); }
 });
 
-logLoad(); logRender();
+function modeUi(){
+  const m = $('saveMode').value;
+  $('saveModeHint').textContent = (m==='files')
+    ? '按「儲存」後，在分享選單選「儲存到檔案」→ 位置選 OneDrive → 選好資料匣，之後會記住這個資料匣。也可以直接在分享選單點 OneDrive 圖示上傳。'
+    : '按「儲存」後，在分享選單選「儲存影像」就會進相簿。檔名會被改掉，之後要靠「紀錄表」的拍攝時間順序對照批號。';
+  $('saveTip').textContent = (m==='files')
+    ? '分享選單：選「儲存到檔案」→ OneDrive → 資料匣；檔名會保留。'
+    : '分享選單：選「儲存影像」。⚠ 相簿裡的檔名會變成 IMG_xxxx，請務必下載「紀錄表」留存。';
+  $('btnSave').textContent = (m==='files') ? '儲存（分享 → 檔案／OneDrive）' : '儲存（分享 → 儲存影像到相簿）';
+  lsSet('cap_mode', m);
+}
+(function(){ const m = lsGet('cap_mode'); if(m) $('saveMode').value = m; })();
+$('saveMode').addEventListener('change', modeUi);
+modeUi();
+logLoad(); logRender(); refreshName();
 </script>
 </body>
 </html>
