@@ -41,6 +41,7 @@ button:disabled,.btn.disabled{opacity:.45;pointer-events:none}
 #scanner.on{display:flex}
 #scanner video{flex:1;width:100%;object-fit:cover;min-height:0}
 #scanner .bar{padding:14px 16px max(14px,env(safe-area-inset-bottom));background:#000;color:#fff;text-align:center}
+#scanOkTxt{white-space:pre-line}
 #scanner .frame{position:absolute;left:50%;top:42%;width:62vmin;height:62vmin;transform:translate(-50%,-50%);
   border:3px solid rgba(255,255,255,.85);border-radius:16px;box-shadow:0 0 0 100vmax rgba(0,0,0,.35)}
 #preview{width:100%;max-height:44vh;object-fit:contain;border-radius:10px;background:#000;display:block}
@@ -75,6 +76,9 @@ button:disabled,.btn.disabled{opacity:.45;pointer-events:none}
   <div id="rawSmall" class="hint"></div>
   <label>完整批號（檔名用）</label>
   <div class="name" id="lotFull">—</div>
+  <label class="hint" style="display:flex;gap:8px;align-items:center;margin-top:8px">
+    <input type="checkbox" id="voiceOn" checked style="width:20px;height:20px">
+    語音提示（用前鏡頭掃描時看不到螢幕，靠聲音知道有沒有掃到）</label>
   <label class="hint" style="display:flex;gap:8px;align-items:center;margin-top:8px">
     <input type="checkbox" id="keepBig" checked style="width:20px;height:20px">
     存完一顆小卷後，保留大卷批號（同一大卷的下一顆只需掃小卷）</label>
@@ -137,6 +141,7 @@ button:disabled,.btn.disabled{opacity:.45;pointer-events:none}
 <div id="scanner">
   <video id="vid" playsinline muted></video>
   <div class="frame"></div>
+  <div id="scanOk" style="position:absolute;inset:0;display:none;align-items:center;justify-content:center;flex-direction:column;background:rgba(22,163,74,.82);color:#fff;text-align:center;padding:24px;z-index:2"><div style="font-size:64px;line-height:1">✔</div><div id="scanOkTxt" style="font-size:22px;font-weight:700;margin-top:10px;word-break:break-all"></div></div>
   <div class="bar"><div id="scanMsg">把批號 QR 放進框裡</div>
     <select id="camSel" style="margin-top:10px;font-size:15px;padding:10px"></select>
     <button id="btnScanClose" type="button" style="margin-top:8px;width:100%">取消</button></div>
@@ -10327,6 +10332,47 @@ $('lotSmall').addEventListener('input', refreshName);
 $('thick').addEventListener('change', ()=>{ lsSet('cap_thick', $('thick').value); refreshName(); });
 (function(){ const t = lsGet('cap_thick'); if(t) $('thick').value = t; })();
 
+/* ---------- 提示音 ---------- */
+let AC = null;
+function ensureAudio(){
+  try{
+    if(!AC){ const C = window.AudioContext || window.webkitAudioContext; if(C) AC = new C(); }
+    if(AC && AC.state === 'suspended') AC.resume();
+  }catch(e){}
+  unlockSpeech();
+}
+function beep(freq, dur, delay){
+  try{
+    if(!AC) return;
+    const t0 = AC.currentTime + (delay||0);
+    const o = AC.createOscillator(), g = AC.createGain();
+    o.type = 'square'; o.frequency.value = freq;
+    g.gain.setValueAtTime(0.0001, t0); g.gain.exponentialRampToValueAtTime(0.9, t0+0.01);
+    g.gain.exponentialRampToValueAtTime(0.0001, t0+dur);
+    o.connect(g); g.connect(AC.destination); o.start(t0); o.stop(t0+dur+0.02);
+  }catch(e){}
+}
+function speak(text){
+  try{
+    if(!$('voiceOn').checked || !('speechSynthesis' in window)) return;
+    speechSynthesis.cancel();
+    const u = new SpeechSynthesisUtterance(text);
+    u.lang = 'zh-TW'; u.rate = 1.05; u.volume = 1;
+    speechSynthesis.speak(u);
+  }catch(e){}
+}
+function unlockSpeech(){ try{ if('speechSynthesis' in window && $('voiceOn').checked){ const u = new SpeechSynthesisUtterance(' '); u.volume = 0; speechSynthesis.speak(u); } }catch(e){} }
+const SND = {
+  ok:   ()=>{ beep(1500, 0.30, 0); },                                              // 掃到一個：長嗶
+  done: ()=>{ beep(1500, 0.18, 0); beep(2000, 0.18, 0.24); beep(2500, 0.32, 0.48); }, // 全部掃完：三聲升調
+  warn: ()=>{ beep(450, 0.25, 0); beep(450, 0.25, 0.35); }                          // 畫面有兩個 QR：兩聲低音
+};
+let okTimer = null;
+function flashOk(text, ms){
+  $('scanOkTxt').textContent = text; $('scanOk').style.display = 'flex';
+  clearTimeout(okTimer); okTimer = setTimeout(()=>{ $('scanOk').style.display = 'none'; }, ms);
+}
+
 /* ---------- 掃描 QR ---------- */
 let stream = null, scanning = false, queue = [], taken = [];
 let camFace = (lsGet('cap_cam') === 'user') ? 'user' : 'environment';
@@ -10390,7 +10436,8 @@ async function startScan(targets, keepTaken){
   scanMsg('請掃「'+TARGET[queue[0]].label+'批號」QR');
   try{ await vid.play(); }catch(e){}
   scanning = true;
-  let pause = 0, tickN = 0;
+  speak('請掃'+TARGET[queue[0]].label+'批號');
+  let pause = 0, tickN = 0, warnAt = 0, idleAt = Date.now() + 12000;
   const tick = ()=>{
     if(!scanning) return;
     if(vid.videoWidth && Date.now() > pause){
@@ -10400,11 +10447,21 @@ async function startScan(targets, keepTaken){
       if(codes.length === 1){
         taken.push(codes[0]); setTarget(cur, codes[0]); queue.shift();
         if(navigator.vibrate) try{ navigator.vibrate(60); }catch(e){}
-        if(!queue.length){ stopScan(); toast('已掃到：'+curLot(), 2600); return; }
+        if(!queue.length){
+          scanning = false; SND.done(); setTimeout(()=> speak('掃描完成'), 800);
+          flashOk(TARGET[cur].label+'批號：'+codes[0]+'\n掃描完成', 1100);
+          setTimeout(()=>{ stopScan(); $('scanOk').style.display='none'; toast('已掃到：'+curLot(), 2600); }, 2200);
+          return;
+        }
+        SND.ok(); setTimeout(()=> speak(TARGET[cur].label+'已掃到，請掃'+TARGET[queue[0]].label+'批號'), 400); idleAt = Date.now() + 12000; flashOk(TARGET[cur].label+'批號：'+codes[0], 1000);
         scanMsg('已掃到'+TARGET[cur].label+'：'+codes[0]+'。請掃「'+TARGET[queue[0]].label+'批號」QR');
-        pause = Date.now() + 1200;
+        pause = Date.now() + 1500;
+      } else if(codes.length === 0 && Date.now() > idleAt){
+        speak('還沒掃到，請把二維碼靠近一點，並避開反光'); idleAt = Date.now() + 12000;
       } else if(codes.length > 1){
         scanMsg('畫面裡有 '+codes.length+' 個 QR，請只對準「'+TARGET[cur].label+'批號」那一個');
+        if(Date.now() > warnAt){ SND.warn(); setTimeout(()=> speak('畫面有兩個二維碼，請只對準一個'), 700); warnAt = Date.now() + 5000; }
+        idleAt = Date.now() + 12000;
       }
     }
     setTimeout(()=> requestAnimationFrame(tick), 90);
@@ -10412,11 +10469,12 @@ async function startScan(targets, keepTaken){
   tick();
 }
 $('btnScan').addEventListener('click', ()=>{
+  ensureAudio();
   const bigFilled = $('lotBig').value.trim() !== '';
   startScan(bigFilled ? ['small'] : ['big','small']);
 });
-$('btnRescanBig').addEventListener('click', ()=> startScan(['big']));
-$('btnRescanSmall').addEventListener('click', ()=> startScan(['small']));
+$('btnRescanBig').addEventListener('click', ()=>{ ensureAudio(); startScan(['big']); });
+$('btnRescanSmall').addEventListener('click', ()=>{ ensureAudio(); startScan(['small']); });
 $('btnScanClose').addEventListener('click', stopScan);
 function camLabelCN(l, i){
   l = l || ''; const s = l.toLowerCase();
@@ -10440,7 +10498,7 @@ async function fillCamList(){
 $('camSel').addEventListener('change', ()=>{
   const sel = $('camSel'); camDev = sel.value; lsSet('cap_dev', camDev);
   lsSet('cap_devname', sel.options[sel.selectedIndex].textContent); camUi();
-  const q = queue.slice(); stopScan(); startScan(q, true);
+  ensureAudio(); const q = queue.slice(); stopScan(); startScan(q, true);
 });
 function flipCam(){ camDev = ''; lsSet('cap_dev',''); lsSet('cap_devname',''); camFace = (camFace === 'user') ? 'environment' : 'user'; lsSet('cap_cam', camFace); camUi(); }
 $('btnCam').addEventListener('click', ()=>{ flipCam(); toast('掃描改用'+(camFace==='user'?'前鏡頭':'後鏡頭')); });
