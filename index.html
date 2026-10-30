@@ -59,7 +59,12 @@ button:disabled,.btn.disabled{opacity:.45;pointer-events:none}
 <div class="card">
   <h2>① 批號（大卷＋小卷）</h2>
   <button class="primary big" id="btnScan" type="button">📷 掃描批號 QR</button>
-  <p class="hint" id="scanHint">會先掃「大卷批號」，再掃「小卷批號」。大卷已有時，只掃小卷。</p>
+  <div class="row" style="margin-top:8px">
+    <button type="button" id="btnCam" style="white-space:nowrap">🔄 <b id="camName">後鏡頭</b></button>
+    <label class="btn" for="qrFile" style="font-size:13px">從照片讀取</label>
+  </div>
+  <input type="file" id="qrFile" accept="image/*" hidden>
+  <p class="hint" id="scanHint">夾著顯微鏡頭時，主鏡頭對不到焦：請把鏡頭改成「前鏡頭」，或掃描畫面下方選「超廣角」。標籤離手機約 20～40 公分，QR 要清楚、不反光。會先掃大卷、再掃小卷；大卷已有時只掃小卷。</p>
   <label for="lotBig">大卷批號</label>
   <div class="row"><input type="text" id="lotBig" autocomplete="off" autocapitalize="characters" placeholder="尚未掃描">
     <button type="button" id="btnRescanBig" style="flex:0 0 auto">重掃</button></div>
@@ -133,7 +138,15 @@ button:disabled,.btn.disabled{opacity:.45;pointer-events:none}
   <video id="vid" playsinline muted></video>
   <div class="frame"></div>
   <div class="bar"><div id="scanMsg">把批號 QR 放進框裡</div>
-    <button id="btnScanClose" type="button" style="margin-top:10px;width:100%">取消</button></div>
+    <select id="camSel" style="margin-top:10px;font-size:15px;padding:10px"></select>
+    <button id="btnScanClose" type="button" style="margin-top:8px;width:100%">取消</button></div>
+</div>
+<div id="pick" style="position:fixed;inset:0;background:rgba(0,0,0,.6);z-index:25;display:none;align-items:center;justify-content:center;padding:16px">
+  <div class="card" style="width:100%;max-width:420px;margin:0">
+    <h2>從照片讀到的 QR</h2>
+    <div id="pickList"></div>
+    <button type="button" id="pickClose" style="width:100%;margin-top:8px">關閉</button>
+  </div>
 </div>
 <div class="toast" id="toast"></div>
 
@@ -10316,10 +10329,14 @@ $('thick').addEventListener('change', ()=>{ lsSet('cap_thick', $('thick').value)
 
 /* ---------- 掃描 QR ---------- */
 let stream = null, scanning = false, queue = [], taken = [];
+let camFace = (lsGet('cap_cam') === 'user') ? 'user' : 'environment';
+let camDev = lsGet('cap_dev') || '';
+function camUi(){ $('camName').textContent = camDev ? (lsGet('cap_devname') || '指定鏡頭') : ((camFace === 'user') ? '前鏡頭' : '後鏡頭'); }
+camUi();
 const vid = $('vid'), cv = document.createElement('canvas'), cx = cv.getContext('2d', {willReadFrequently:true});
 const TARGET = {big:{label:'大卷', inp:'lotBig', raw:'rawBig'}, small:{label:'小卷', inp:'lotSmall', raw:'rawSmall'}};
-function grab(source, w, h){
-  const k = Math.min(1, 1000 / Math.max(w, h));
+function grab(source, w, h, maxSide){
+  const k = Math.min(1, (maxSide || 1000) / Math.max(w, h));
   cv.width = Math.round(w*k); cv.height = Math.round(h*k);
   cx.drawImage(source, 0, 0, cv.width, cv.height);
 }
@@ -10329,8 +10346,8 @@ function decodeRegion(x, y, w, h){
 }
 // 回傳畫面中找得到的所有 QR 內容。jsQR 同一畫面有兩個 QR 時常讀不出來，
 // 所以另外把畫面切成左右、上下、四角再各讀一次，最後合併。
-function findCodes(source, w, h){
-  grab(source, w, h);
+function findCodes(source, w, h, maxSide){
+  grab(source, w, h, maxSide);
   const W = cv.width, H = cv.height, hw = Math.floor(W/2), hh = Math.floor(H/2);
   const regs = [[0,0,W,H],[0,0,hw,H],[hw,0,W-hw,H],[0,0,W,hh],[0,hh,W,H-hh],
                 [0,0,hw,hh],[hw,0,W-hw,hh],[0,hh,hw,H-hh],[hw,hh,W-hw,H-hh]];
@@ -10354,24 +10371,31 @@ function setTarget(name, text){
   refreshName();
 }
 function scanMsg(s){ $('scanMsg').textContent = s; }
-async function startScan(targets){
+async function startScan(targets, keepTaken){
   if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
     toast('這個瀏覽器不能開相機掃描，請直接輸入批號', 3500); return; }
-  queue = targets.slice(); taken = [];
-  try{
-    stream = await navigator.mediaDevices.getUserMedia({video:{facingMode:{ideal:'environment'}, width:{ideal:1920}, height:{ideal:1080}}, audio:false});
-  }catch(e){
-    toast('無法開啟相機（請允許相機權限，並用 https 網址開啟）', 4000); return; }
+  queue = targets.slice(); if(!keepTaken) taken = [];
+  const base = {width:{ideal:1920}, height:{ideal:1080}};
+  const tries = [];
+  if(camDev) tries.push(Object.assign({deviceId:{exact:camDev}}, base));
+  tries.push(Object.assign({facingMode:{ideal:camFace}}, base));
+  stream = null;
+  for(const v of tries){
+    try{ stream = await navigator.mediaDevices.getUserMedia({video:v, audio:false}); break; }catch(e){ if(v.deviceId){ camDev = ''; lsSet('cap_dev',''); } }
+  }
+  if(!stream){ toast('無法開啟相機（請允許相機權限，並用 https 網址開啟）', 4000); return; }
+  fillCamList();
   vid.srcObject = stream;
   $('scanner').classList.add('on');
   scanMsg('請掃「'+TARGET[queue[0]].label+'批號」QR');
   try{ await vid.play(); }catch(e){}
   scanning = true;
-  let pause = 0;
+  let pause = 0, tickN = 0;
   const tick = ()=>{
     if(!scanning) return;
     if(vid.videoWidth && Date.now() > pause){
-      const codes = findCodes(vid, vid.videoWidth, vid.videoHeight).filter(c=> !taken.includes(c));
+      tickN++;
+      const codes = findCodes(vid, vid.videoWidth, vid.videoHeight, (tickN % 2) ? 1000 : 1600).filter(c=> !taken.includes(c));
       const cur = queue[0];
       if(codes.length === 1){
         taken.push(codes[0]); setTarget(cur, codes[0]); queue.shift();
@@ -10394,6 +10418,73 @@ $('btnScan').addEventListener('click', ()=>{
 $('btnRescanBig').addEventListener('click', ()=> startScan(['big']));
 $('btnRescanSmall').addEventListener('click', ()=> startScan(['small']));
 $('btnScanClose').addEventListener('click', stopScan);
+function camLabelCN(l, i){
+  l = l || ''; const s = l.toLowerCase();
+  if(/front|前/.test(s)) return '前鏡頭';
+  if(/ultra|超廣|0\.5/.test(s)) return '後置超廣角';
+  if(/tele|望遠/.test(s)) return '後置望遠';
+  if(/back|rear|後/.test(s)) return '後置主鏡頭';
+  return l || ('鏡頭 '+(i+1));
+}
+async function fillCamList(){
+  const sel = $('camSel'); sel.innerHTML = '';
+  let devs = [];
+  try{ devs = (await navigator.mediaDevices.enumerateDevices()).filter(d=> d.kind==='videoinput'); }catch(e){}
+  const cur = stream && stream.getVideoTracks()[0] ? stream.getVideoTracks()[0].getSettings().deviceId : '';
+  devs.forEach((d,i)=>{
+    const o = document.createElement('option'); o.value = d.deviceId; o.textContent = camLabelCN(d.label, i);
+    if(d.deviceId === cur) o.selected = true; sel.appendChild(o);
+  });
+  sel.style.display = devs.length > 1 ? 'block' : 'none';
+}
+$('camSel').addEventListener('change', ()=>{
+  const sel = $('camSel'); camDev = sel.value; lsSet('cap_dev', camDev);
+  lsSet('cap_devname', sel.options[sel.selectedIndex].textContent); camUi();
+  const q = queue.slice(); stopScan(); startScan(q, true);
+});
+function flipCam(){ camDev = ''; lsSet('cap_dev',''); lsSet('cap_devname',''); camFace = (camFace === 'user') ? 'environment' : 'user'; lsSet('cap_cam', camFace); camUi(); }
+$('btnCam').addEventListener('click', ()=>{ flipCam(); toast('掃描改用'+(camFace==='user'?'前鏡頭':'後鏡頭')); });
+
+
+/* ---------- 從照片讀取 QR ---------- */
+function showPick(codes){
+  const box = $('pickList'); box.innerHTML = '';
+  if(!codes.length){
+    const p = document.createElement('p'); p.className = 'warn'; p.textContent = '這張照片裡讀不到 QR。請拍近一點、對準、避免反光後再試。'; box.appendChild(p);
+  }
+  codes.forEach(c=>{
+    const d = document.createElement('div'); d.className = 'name'; d.textContent = c; box.appendChild(d);
+    const r = document.createElement('div'); r.className = 'row'; r.style.marginBottom = '10px';
+    [['big','設為大卷批號'],['small','設為小卷批號']].forEach(([k,lab])=>{
+      const b = document.createElement('button'); b.type = 'button'; b.textContent = lab;
+      b.addEventListener('click', ()=>{ setTarget(k, c); toast('已設為'+TARGET[k].label+'批號'); if($('lotBig').value.trim() && $('lotSmall').value.trim()) $('pick').style.display = 'none'; });
+      r.appendChild(b);
+    });
+    box.appendChild(r);
+  });
+  $('pick').style.display = 'flex';
+}
+$('pickClose').addEventListener('click', ()=>{ $('pick').style.display = 'none'; });
+$('qrFile').addEventListener('change', async ()=>{
+  const f = $('qrFile').files && $('qrFile').files[0]; $('qrFile').value = '';
+  if(!f) return;
+  try{
+    let bmp;
+    try{ bmp = await createImageBitmap(f, {imageOrientation:'from-image'}); }
+    catch(e){ bmp = await createImageBitmap(f); }
+    const found = [];
+    // 用幾種大小各讀一次，QR 在照片裡佔比小時，放大讀取比較容易成功
+    for(const side of [1000, 1600]){
+      const k = Math.min(1, side / Math.max(bmp.width, bmp.height));
+      const w = Math.round(bmp.width*k), h = Math.round(bmp.height*k);
+      const tmp = document.createElement('canvas'); tmp.width = w; tmp.height = h;
+      tmp.getContext('2d').drawImage(bmp, 0, 0, w, h);
+      findCodes(tmp, w, h, side).forEach(c=>{ if(!found.includes(c)) found.push(c); });
+      if(found.length >= 2) break;
+    }
+    showPick(found);
+  }catch(e){ toast('讀不到這張照片', 3000); }
+});
 
 /* ---------- 拍照 ---------- */
 $('btnShoot').addEventListener('click', e=>{
