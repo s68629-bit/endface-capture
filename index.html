@@ -60,6 +60,17 @@ button:disabled,.btn.disabled{opacity:.45;pointer-events:none}
 <div class="card">
   <h2>① 批號（大卷＋小卷）</h2>
   <button class="primary big" id="btnScan" type="button">📷 掃描批號 QR</button>
+  <label for="scanMode" style="margin-top:10px">掃描方式</label>
+  <select id="scanMode">
+    <option value="dual">一次掃兩個（標籤上的大卷＋小卷同時對準）</option>
+    <option value="single">分開掃（先大卷、再小卷）</option>
+  </select>
+  <details style="margin-top:6px"><summary class="hint" style="cursor:pointer">一次掃兩個時，怎麼分辨大卷和小卷？</summary>
+    <p class="hint">依 QR 內容的開頭字母判斷。你的標籤：大卷＝ZC…，小卷＝R…。可修改：</p>
+    <div class="row"><div><label for="preBig">大卷開頭</label><input type="text" id="preBig" value="ZC" autocapitalize="characters"></div>
+    <div><label for="preSmall">小卷開頭</label><input type="text" id="preSmall" value="R" autocapitalize="characters"></div></div>
+    <p class="hint">兩個都不符合開頭時，會改用長度判斷（較長的當大卷）並語音提醒你核對。</p>
+  </details>
   <div class="row" style="margin-top:8px">
     <button type="button" id="btnCam" style="white-space:nowrap">🔄 <b id="camName">後鏡頭</b></button>
     <label class="btn" for="qrFile" style="font-size:13px">從照片讀取</label>
@@ -10417,7 +10428,16 @@ function setTarget(name, text){
   refreshName();
 }
 function scanMsg(s){ $('scanMsg').textContent = s; }
-async function startScan(targets, keepTaken){
+let scanDual = false;
+function pre(id){ return ($(id).value || '').trim().toUpperCase(); }
+function classifyCode(c){
+  const u = String(c).toUpperCase(), pb = pre('preBig'), ps = pre('preSmall');
+  const mb = pb && u.startsWith(pb), ms = ps && u.startsWith(ps);
+  if(mb && ms) return pb.length >= ps.length ? 'big' : 'small';
+  return mb ? 'big' : (ms ? 'small' : '');
+}
+async function startScan(targets, keepTaken, dual){
+  scanDual = !!dual;
   if(!navigator.mediaDevices || !navigator.mediaDevices.getUserMedia){
     toast('這個瀏覽器不能開相機掃描，請直接輸入批號', 3500); return; }
   queue = targets.slice(); if(!keepTaken) taken = [];
@@ -10433,18 +10453,60 @@ async function startScan(targets, keepTaken){
   fillCamList();
   vid.srcObject = stream;
   $('scanner').classList.add('on');
-  scanMsg('請掃「'+TARGET[queue[0]].label+'批號」QR');
+  scanMsg(scanDual ? '請把標籤上的兩個 QR 都放進畫面' : '請掃「'+TARGET[queue[0]].label+'批號」QR');
   try{ await vid.play(); }catch(e){}
   scanning = true;
-  speak('請掃'+TARGET[queue[0]].label+'批號');
+  speak(scanDual ? '請同時對準大卷和小卷' : '請掃'+TARGET[queue[0]].label+'批號');
   let pause = 0, tickN = 0, warnAt = 0, idleAt = Date.now() + 12000;
+  const found = {big:null, small:null}, pend = [], seen = [];
+  function dualStep(codes){
+    let changed = false, guessed = false;
+    codes.forEach(c=>{
+      if(seen.includes(c)) return; seen.push(c);
+      const k = classifyCode(c);
+      if(k && !found[k]){ found[k] = c; changed = true; } else pend.push(c);
+    });
+    while(pend.length && (!found.big || !found.small)){
+      if(!found.big && !found.small){
+        if(pend.length < 2) break;
+        pend.sort((a,b)=> b.length - a.length);
+        found.big = pend.shift(); found.small = pend.shift();
+      } else {
+        found[!found.big ? 'big' : 'small'] = pend.shift();
+      }
+      guessed = true; changed = true;
+    }
+    if(found.big && found.small){
+      const prevBig = $('lotBig').value.trim();
+      taken.push(found.big, found.small);
+      setTarget('big', found.big); setTarget('small', found.small); queue = [];
+      scanning = false; SND.done();
+      let say = '掃描完成';
+      if(guessed) say = '掃描完成，但無法依開頭判斷大小卷，請核對批號';
+      else if(prevBig && prevBig !== found.big && $('keepBig').checked) say = '掃描完成，注意，大卷批號和上一顆不同';
+      setTimeout(()=> speak(say), 800);
+      flashOk('大卷：'+found.big+'\n小卷：'+found.small+'\n掃描完成', 1100);
+      setTimeout(()=>{ stopScan(); $('scanOk').style.display='none'; toast('已掃到：'+curLot(), 2600); }, 2400);
+      return;
+    }
+    if(changed){
+      const k = found.big ? 'big' : 'small';
+      SND.ok(); setTimeout(()=> speak(TARGET[k].label+'已掃到，請把另一個也對準'), 400);
+      idleAt = Date.now() + 12000;
+      scanMsg('已掃到'+TARGET[k].label+'：'+found[k]+'。還差另一個');
+    } else if(codes.length === 0 && Date.now() > idleAt){
+      speak(found.big || found.small ? '還差一個，請把另一個二維碼也對準' : '還沒掃到，請把標籤靠近一點，並避開反光');
+      idleAt = Date.now() + 12000;
+    }
+  }
   const tick = ()=>{
     if(!scanning) return;
     if(vid.videoWidth && Date.now() > pause){
       tickN++;
       const codes = findCodes(vid, vid.videoWidth, vid.videoHeight, (tickN % 2) ? 1000 : 1600).filter(c=> !taken.includes(c));
       const cur = queue[0];
-      if(codes.length === 1){
+      if(scanDual){ dualStep(codes); }
+      else if(codes.length === 1){
         taken.push(codes[0]); setTarget(cur, codes[0]); queue.shift();
         if(navigator.vibrate) try{ navigator.vibrate(60); }catch(e){}
         if(!queue.length){
@@ -10470,6 +10532,7 @@ async function startScan(targets, keepTaken){
 }
 $('btnScan').addEventListener('click', ()=>{
   ensureAudio();
+  if($('scanMode').value === 'dual'){ startScan(['big','small'], false, true); return; }
   const bigFilled = $('lotBig').value.trim() !== '';
   startScan(bigFilled ? ['small'] : ['big','small']);
 });
@@ -10498,7 +10561,7 @@ async function fillCamList(){
 $('camSel').addEventListener('change', ()=>{
   const sel = $('camSel'); camDev = sel.value; lsSet('cap_dev', camDev);
   lsSet('cap_devname', sel.options[sel.selectedIndex].textContent); camUi();
-  ensureAudio(); const q = queue.slice(); stopScan(); startScan(q, true);
+  ensureAudio(); const q = queue.slice(), d = scanDual; stopScan(); startScan(q, true, d);
 });
 function flipCam(){ camDev = ''; lsSet('cap_dev',''); lsSet('cap_devname',''); camFace = (camFace === 'user') ? 'environment' : 'user'; lsSet('cap_cam', camFace); camUi(); }
 $('btnCam').addEventListener('click', ()=>{ flipCam(); toast('掃描改用'+(camFace==='user'?'前鏡頭':'後鏡頭')); });
@@ -10641,6 +10704,10 @@ function modeUi(){
 (function(){ const m = lsGet('cap_mode'); if(m) $('saveMode').value = m; })();
 $('saveMode').addEventListener('change', modeUi);
 modeUi();
+['scanMode','preBig','preSmall'].forEach(id=>{
+  const v = lsGet('cap_'+id); if(v !== null && v !== '') $(id).value = v;
+  $(id).addEventListener('change', ()=> lsSet('cap_'+id, $(id).value));
+});
 logLoad(); logRender(); refreshName();
 </script>
 </body>
